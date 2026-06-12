@@ -1,20 +1,34 @@
 import streamlit as st
-import fitz  # PyMuPDF
+import fitz
+import requests
 import pandas as pd
 import json
 import re
 import sqlite3
+import os
+from datetime import datetime
 
 # =========================
-# DATABASE SETUP
+# DATABASE SETUP (tout-en-un)
 # =========================
 DB_PATH = "saas.db"
 
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute('''CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT UNIQUE, password TEXT)''')
-    c.execute('''CREATE TABLE IF NOT EXISTS pdf_history (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, filename TEXT, json_data TEXT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, FOREIGN KEY(user_id) REFERENCES users(id))''')
+    c.execute('''CREATE TABLE IF NOT EXISTS users (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        username TEXT UNIQUE,
+        password TEXT
+    )''')
+    c.execute('''CREATE TABLE IF NOT EXISTS pdf_history (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER,
+        filename TEXT,
+        json_data TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY(user_id) REFERENCES users(id)
+    )''')
     conn.commit()
     conn.close()
 
@@ -72,85 +86,127 @@ if "chat" not in st.session_state:
     st.session_state.chat = []
 
 # =========================
-# EXTRACTION TEXTE PDF
+# FONCTIONS D'EXTRACTION PDF
 # =========================
-def extract_text(file_bytes):
-    if not file_bytes:
-        raise ValueError("Fichier vide")
-    doc = fitz.open(stream=file_bytes, filetype="pdf")
-    full_text = ""
+def extract_text(file):
+    if file is None:
+        return ""
+    doc = fitz.open(stream=file.read(), filetype="pdf")
+    text = []
     for page in doc:
-        full_text += page.get_text()
-    return full_text
+        blocks = page.get_text("blocks")
+        for b in blocks:
+            txt = b[4].strip()
+            if txt:
+                text.append(txt)
+    return "\n".join(text)
+
+def extract_currencies(text):
+    pattern = re.compile(r"(\d+)\s+([A-Z]{3})\s+(.+?)\s+([0-9,]+)\s+([0-9,]+)")
+    currencies = []
+    for line in text.splitlines():
+        m = pattern.search(line)
+        if m:
+            currencies.append({
+                "WNR": m.group(1),
+                "ISO": m.group(2),
+                "Waehrung": m.group(3).strip(),
+                "Ankauf": m.group(4),
+                "Verkauf": m.group(5)
+            })
+    return currencies
+
+def parse_json(raw):
+    try:
+        return json.loads(raw)
+    except:
+        match = re.search(r"\{[\s\S]*\}", raw)
+        if match:
+            try:
+                return json.loads(match.group())
+            except:
+                pass
+    return {
+        "company_name": "",
+        "document_type": "",
+        "date": "",
+        "summary": "",
+        "invoice_total": "",
+        "articles": []
+    }
 
 # =========================
-# EXTRACTION DES ARTICLES (format tableau)
+# APPEL À L'IA (Hugging Face)
 # =========================
-def extract_articles_from_text(text):
+def ask_huggingface(prompt, model="mistralai/Mistral-7B-Instruct-v0.3"):
+    token = st.secrets.get("HF_TOKEN")
+    if not token:
+        st.error("❌ HF_TOKEN manquant dans les secrets. L'extraction JSON est désactivée.")
+        return "{}"
+    
+    API_URL = f"https://api-inference.huggingface.co/models/{model}"
+    headers = {"Authorization": f"Bearer {token}"}
+    payload = {
+        "inputs": prompt,
+        "parameters": {
+            "max_new_tokens": 512,
+            "temperature": 0.2,
+            "return_full_text": False
+        }
+    }
+    try:
+        response = requests.post(API_URL, headers=headers, json=payload, timeout=30)
+        response.raise_for_status()
+        result = response.json()
+        if isinstance(result, list) and len(result) > 0:
+            return result[0].get("generated_text", "{}")
+        elif isinstance(result, dict):
+            return result.get("generated_text", "{}")
+        else:
+            return "{}"
+    except Exception as e:
+        st.error(f"Erreur API : {e}")
+        return "{}"
+
+# =========================
+# CHAT AVEC IA
+# =========================
+def chat_with_pdf(question, pdf_text, json_data):
+    prompt = f"""
+Tu es un assistant expert en analyse de documents PDF.
+Voici le texte extrait du PDF :
+{pdf_text[:3000]}
+
+Voici les données structurées extraites :
+{json_data}
+
+Question : {question}
+Réponds de manière claire et concise en te basant uniquement sur le document.
+"""
+    return ask_huggingface(prompt)
+
+# =========================
+# FALLBACK EXTRACTION ARTICLES PAR REGEX (si l'IA échoue)
+# =========================
+def extract_articles_regex(text):
     """
-    Extrait les articles d'une facture ou bon de commande.
-    Cherche les lignes contenant 'Pos.' puis extrait les données structurées.
+    Extrait les articles à partir du tableau présent dans le PDF.
     Exemple de ligne : "1  MA0R00004  10.000,0 kg  1,29  12.900,00  LDPE 150 E natur"
     """
-    lines = text.splitlines()
     articles = []
-    # On cherche la ligne contenant les en-têtes (Pos., Artikelnummer, Menge, etc.)
-    header_index = -1
-    for i, line in enumerate(lines):
-        if "Pos." in line and "Artikelnummer" in line and "Menge" in line:
-            header_index = i
-            break
-    
-    if header_index == -1:
-        # Fallback : chercher des motifs numériques sur les lignes suivantes
-        # On va juste chercher des lignes qui commencent par un nombre et contiennent 'kg' ou 'EUR'
-        pattern = re.compile(r'^(\d+)\s+(\S+)\s+([\d\.,]+\s*kg)\s+([\d\.,]+)\s+([\d\.,]+)\s+(.+)', re.IGNORECASE)
-        for line in lines:
-            match = pattern.match(line)
-            if match:
-                articles.append({
-                    "article_number": match.group(2),
-                    "description": match.group(6).strip(),
-                    "quantity": match.group(3).replace('kg', '').strip(),
-                    "price": match.group(4).replace(',', '.'),
-                    "total": match.group(5).replace(',', '.')
-                })
-        return articles
-
-    # On a trouvé l'en-tête, on parcourt les lignes suivantes
-    for i in range(header_index+1, len(lines)):
-        line = lines[i].strip()
-        if not line:
-            continue
-        # On essaie de splitter sur plusieurs espaces
-        parts = re.split(r'\s{2,}', line)
-        if len(parts) >= 6:
-            # Format: Pos. Artikelnummer Menge Preis Gesamtpreis Bezeichnung
-            # parts[0] = Pos (on ignore)
-            artikel_nummer = parts[1]
-            menge = parts[2].replace('kg', '').strip()
-            preis = parts[3].replace(',', '.')
-            gesamt = parts[4].replace(',', '.')
-            bezeichnung = parts[5]
+    lines = text.splitlines()
+    # Pattern pour capturer les lignes d'article
+    pattern = re.compile(r'^\d+\s+(\S+)\s+([\d\.,]+\s*kg)\s+([\d\.,]+)\s+([\d\.,]+)\s+(.+)$', re.IGNORECASE)
+    for line in lines:
+        m = pattern.match(line.strip())
+        if m:
             articles.append({
-                "article_number": artikel_nummer,
-                "description": bezeichnung,
-                "quantity": menge,
-                "price": preis,
-                "total": gesamt
+                "article_number": m.group(1),
+                "description": m.group(5).strip(),
+                "quantity": m.group(2).replace('kg', '').strip(),
+                "price": m.group(3).replace(',', '.'),
+                "total": m.group(4).replace(',', '.')
             })
-        else:
-            # Essayer un autre pattern (ligne sans séparateurs multiples)
-            pattern = re.compile(r'^\d+\s+(\S+)\s+([\d\.,]+\s*kg)\s+([\d\.,]+)\s+([\d\.,]+)\s+(.+)')
-            match = pattern.match(line)
-            if match:
-                articles.append({
-                    "article_number": match.group(1),
-                    "description": match.group(5).strip(),
-                    "quantity": match.group(2).replace('kg', '').strip(),
-                    "price": match.group(3).replace(',', '.'),
-                    "total": match.group(4).replace(',', '.')
-                })
     return articles
 
 # =========================
@@ -165,43 +221,46 @@ h1,h2,h3,h4,h5,p,label,span { color: white !important; }
 textarea, input { background: rgba(255,255,255,0.95) !important; color: black !important; border-radius: 14px !important; }
 [data-testid="stDataFrame"] { background: rgba(255,255,255,0.95); border-radius: 15px; overflow: hidden; }
 [data-testid="stDataFrame"] * { color: black !important; }
-.pdf-card { background: rgba(255,255,255,0.08); backdrop-filter: blur(14px); border: 1px solid rgba(255,255,255,0.12); border-radius: 24px; padding: 28px; margin-top: 20px; margin-bottom: 20px; box-shadow: 0 8px 32px rgba(0,0,0,0.35); }
-.info-row { display: flex; justify-content: space-between; padding: 16px 0; border-bottom: 1px solid rgba(255,255,255,0.08); }
-.info-label { font-weight: 600; color: #94a3b8 !important; }
-.info-value { font-weight: 700; text-align: right; }
-.total-box { margin-top: 20px; background: linear-gradient(90deg,#2563eb,#06b6d4); border-radius: 18px; padding: 18px; text-align: center; font-size: 28px; font-weight: bold; }
-.stButton button { background: linear-gradient(90deg,#2563eb,#0ea5e9); color: white; border: none; border-radius: 14px; padding: 12px 22px; font-weight: bold; }
+.pdf-card { background: rgba(255,255,255,0.08); backdrop-filter: blur(14px); border: 1px solid rgba(255,255,255,0.12); border-radius: 24px; padding: 28px; margin-top: 20px; margin-bottom: 20px; box-shadow: 0 8px 32px rgba(0,0,0,0.35); transition: 0.3s; }
+.pdf-card:hover { transform: translateY(-4px); }
+.info-row { display: flex; justify-content: space-between; align-items: center; padding: 16px 0; border-bottom: 1px solid rgba(255,255,255,0.08); }
+.info-label { font-size: 16px; font-weight: 600; color: #94a3b8 !important; }
+.info-value { font-size: 18px; font-weight: 700; text-align: right; }
+.total-box { margin-top: 20px; background: linear-gradient(90deg,#2563eb,#06b6d4); border-radius: 18px; padding: 18px; text-align: center; font-size: 28px; font-weight: bold; box-shadow: 0 6px 20px rgba(37,99,235,0.4); }
+.stButton button { background: linear-gradient(90deg,#2563eb,#0ea5e9); color: white; border: none; border-radius: 14px; padding: 12px 22px; font-weight: bold; transition: 0.3s; }
+.stButton button:hover { transform: scale(1.03); }
 section[data-testid="stSidebar"] { background: rgba(15,23,42,0.88); backdrop-filter: blur(10px); }
+.card { background: rgba(255,255,255,0.05); border-radius: 16px; padding: 12px; margin-bottom: 10px; }
 </style>
 """, unsafe_allow_html=True)
 
 st.title("📄 PDF AI SaaS - Test Client")
 
 # =========================
-# AUTHENTIFICATION
+# AUTH
 # =========================
 if st.session_state.user_id is None:
-    st.subheader("🔐 Connexion / Inscription")
+    st.subheader("🔐 Login / Register")
     tab1, tab2 = st.tabs(["Login", "Register"])
     with tab1:
-        u = st.text_input("Nom d'utilisateur")
-        p = st.text_input("Mot de passe", type="password")
-        if st.button("Se connecter"):
+        u = st.text_input("Username")
+        p = st.text_input("Password", type="password")
+        if st.button("Login"):
             uid = login_user(u, p)
             if uid:
                 st.session_state.user_id = uid
-                st.success("Connecté !")
+                st.success("Logged in successfully")
                 st.rerun()
             else:
-                st.error("Identifiants invalides")
+                st.error("Invalid credentials")
     with tab2:
-        u2 = st.text_input("Nouveau nom")
-        p2 = st.text_input("Nouveau mot de passe", type="password")
-        if st.button("S'inscrire"):
+        u2 = st.text_input("New username")
+        p2 = st.text_input("New password", type="password")
+        if st.button("Register"):
             if register_user(u2, p2):
-                st.success("Compte créé, vous pouvez vous connecter")
+                st.success("Account created")
             else:
-                st.error("Ce nom existe déjà")
+                st.error("User already exists")
     st.stop()
 
 st.sidebar.success(f"Connecté (ID {st.session_state.user_id})")
@@ -215,95 +274,144 @@ if st.sidebar.button("Déconnexion"):
 # =========================
 # UPLOAD PDF
 # =========================
-file = st.file_uploader("📤 Télécharger un PDF", type=["pdf"])
+file = st.file_uploader("📤 Upload PDF", type=["pdf"])
 
 if file:
-    try:
-        file_bytes = file.read()
-        if len(file_bytes) == 0:
-            st.error("Le fichier est vide.")
-            st.stop()
+    # Extraction du texte
+    st.session_state.pdf_text = extract_text(file)
+    text = st.session_state.pdf_text
+    st.success(f"Texte extrait : {len(text)} caractères")
 
-        with st.spinner("Extraction du texte..."):
-            text = extract_text(file_bytes)
-        st.session_state.pdf_text = text
-        st.success(f"✅ Texte extrait : {len(text)} caractères")
+    # Devises
+    currencies = extract_currencies(text)
+    if currencies:
+        st.subheader("💱 Wechselkurse")
+        st.dataframe(pd.DataFrame(currencies), use_container_width=True)
 
-        # Aperçu du texte pour débogage (optionnel)
-        with st.expander("🔍 Aperçu du texte brut (premières lignes)"):
-            st.code("\n".join(text.splitlines()[:40]))
+    col1, col2 = st.columns(2)
+    with col1:
+        if st.button("🧠 Extract JSON"):
+            extraction_prompt = """
+You are an expert invoice extraction AI.
 
-        # Extraction des articles
-        articles = extract_articles_from_text(text)
-        if articles:
-            st.subheader("📦 Articles extraits")
-            df_articles = pd.DataFrame(articles)
-            st.dataframe(df_articles, use_container_width=True)
-        else:
-            st.info("Aucun article trouvé. Vérifiez le format du PDF (doit contenir des lignes avec 'Pos.' et des valeurs).")
+RULES:
+- Output ONLY valid JSON
+- No markdown
+- No explanations
+- Preserve original language
+- Detect invoice date carefully
+- Extract exact total amount
+- Create a short summary of the document
+- If missing value use ""
 
-        # Sauvegarde en base
-        if st.button("💾 Sauvegarder les articles en base"):
-            data = {"articles": articles}
+SCHEMA:
+{
+  "company_name": "",
+  "document_type": "",
+  "date": "",
+  "summary": "",
+  "invoice_total": "",
+  "articles": [
+    {
+      "article_number": "",
+      "description": "",
+      "quantity": "",
+      "price": "",
+      "total": ""
+    }
+  ]
+}
+
+DOCUMENT:
+"""
+            with st.spinner("Appel à l'IA..."):
+                result = ask_huggingface(extraction_prompt + text)
+            st.subheader("RAW LLM RESPONSE")
+            st.code(result)
+            data = parse_json(result)
+            # Si l'IA n'a rien extrait, on utilise le fallback regex
+            if not data.get("articles"):
+                fallback_articles = extract_articles_regex(text)
+                if fallback_articles:
+                    data["articles"] = fallback_articles
+                    st.info("Utilisation de l'extraction par regex (fallback) car l'IA n'a pas retourné d'articles.")
             st.session_state.json_data = data
             save_pdf(st.session_state.user_id, file.name, data)
-            st.success("✅ Données sauvegardées")
+            st.success("Saved to database ✔")
 
-        # Afficher le JSON extrait (pour info)
-        if articles:
-            st.subheader("📄 Données JSON extraites")
-            st.json({"articles": articles})
-
-    except Exception as e:
-        st.error(f"❌ Erreur : {type(e).__name__} – {e}")
-        st.exception(e)
+    with col2:
+        st.write("Nombre de caractères :", len(text))
+        st.text_area("📄 PDF TEXT", text, height=500)
 
 # =========================
-# AFFICHAGE DES DONNÉES SAUVEGARDÉES
+# STRUCTURED DATA
 # =========================
 if st.session_state.json_data:
-    st.subheader("📦 Données sauvegardées (dernier PDF)")
-    st.json(st.session_state.json_data)
+    data = st.session_state.json_data
+    st.subheader("📦 Extracted Data")
+    st.markdown(f"""
+<div class="pdf-card">
+    <div class="info-row"><div class="info-label">🏢 Company</div><div class="info-value">{data.get("company_name","")}</div></div>
+    <div class="info-row"><div class="info-label">📝 Summary</div><div class="info-value">{data.get("summary","")}</div></div>
+    <div class="info-row"><div class="info-label">📄 Type</div><div class="info-value">{data.get("document_type","")}</div></div>
+    <div class="info-row"><div class="info-label">📅 Date</div><div class="info-value">{data.get("date","")}</div></div>
+    <div class="total-box">💰 Total : {data.get("invoice_total","")}</div>
+</div>
+""", unsafe_allow_html=True)
+
+    if isinstance(data.get("articles"), list) and data["articles"]:
+        st.subheader("📦 Articles")
+        df = pd.DataFrame(data["articles"])
+        for i, row in df.iterrows():
+            st.markdown(f"""
+            <div class="card">
+                <b>Article {i+1}</b><br><br>
+                {row.get('description','')}<br>
+                Qty: {row.get('quantity','')}<br>
+                Price: {row.get('price','')}<br>
+                Total: <b>{row.get('total','')}</b>
+            </div>
+            """, unsafe_allow_html=True)
+        st.dataframe(df, use_container_width=True)
+    else:
+        st.info("Aucun article détecté.")
 
 # =========================
-# HISTORIQUE
+# HISTORY
 # =========================
-st.divider()
-st.subheader("📚 Historique des PDF traités")
-history = get_documents(st.session_state.user_id)
-for doc_id, filename, data in history:
-    with st.expander(f"📄 {filename}"):
-        st.json(data)
+if st.session_state.user_id:
+    st.divider()
+    st.subheader("📚 My PDF History")
+    history = get_documents(st.session_state.user_id)
+    for doc_id, filename, data in history:
+        st.markdown(f"""
+        <div class="card">
+            <b>{filename}</b><br>
+            <small>{str(data)[:200]}...</small>
+        </div>
+        """, unsafe_allow_html=True)
 
 # =========================
-# CHAT ASSISTANT (recherche améliorée)
+# CHAT
 # =========================
 st.divider()
-st.subheader("💬 Assistant PDF (recherche dans le texte)")
-if st.session_state.pdf_text:
-    st.info("Vous pouvez poser des questions sur le contenu du document actuel.")
-    q = st.chat_input("Votre question")
-    if q:
-        # Recherche simple par mots-clés
-        text_lower = st.session_state.pdf_text.lower()
-        q_lower = q.lower()
-        if q_lower in text_lower:
-            # Extraire le contexte autour de la réponse
-            idx = text_lower.find(q_lower)
-            start = max(0, idx-100)
-            end = min(len(text_lower), idx+200)
-            snippet = st.session_state.pdf_text[start:end]
-            st.chat_message("assistant").write(f"Oui, j'ai trouvé :\n\n...{snippet}...")
-        else:
-            # Proposer des mots clés alternatifs
-            words = q_lower.split()
-            found = []
-            for word in words:
-                if word in text_lower and len(word) > 3:
-                    found.append(word)
-            if found:
-                st.chat_message("assistant").write(f"Je n'ai pas trouvé exactement '{q}', mais voici des mots présents : {', '.join(found)}. Essayez avec ces termes.")
-            else:
-                st.chat_message("assistant").write("Désolé, je n'ai pas trouvé cette information dans le document.")
-else:
-    st.info("Téléchargez un PDF pour pouvoir poser des questions.")
+st.subheader("💬 AI Assistant")
+for m in st.session_state.chat:
+    with st.chat_message(m["role"]):
+        st.write(m["content"])
+
+q = st.chat_input("Ask your PDF...")
+if q:
+    st.session_state.chat.append({"role": "user", "content": q})
+    with st.chat_message("user"):
+        st.write(q)
+    with st.chat_message("assistant"):
+        with st.spinner("Réflexion..."):
+            answer = chat_with_pdf(
+                q,
+                st.session_state.pdf_text,
+                json.dumps(st.session_state.json_data) if st.session_state.json_data else "{}"
+            )
+            st.write(answer)
+    st.session_state.chat.append({"role": "assistant", "content": answer})
+    st.rerun()
