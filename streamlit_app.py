@@ -95,7 +95,7 @@ def get_hf_client():
     token = st.secrets.get("HF_TOKEN", "")
     if not token:
         st.warning("⚠️ HF_TOKEN not set. JSON extraction will use mock data.")
-    return InferenceClient(token=token) if token else None
+        return InferenceClient(token=token, provider="nebius") if token else None
 
 client = get_hf_client()
 
@@ -112,12 +112,18 @@ def ask_huggingface(prompt, model="meta-llama/Llama-3.2-3B-Instruct"):
         }
         '''
     try:
-        response = client.text_generation(prompt, model=model, max_new_tokens=512, temperature=0.2, do_sample=False)
-        return response
+        # Utilisation de la nouvelle méthode chat_completion
+        response = client.chat_completion(
+            model=model,
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=512,
+            temperature=0.2,
+            stream=False
+        )
+        return response.choices[0].message.content
     except Exception as e:
         st.error(f"HF API error: {e}")
         return "{}"
-
 # =========================
 # PDF EXTRACTION
 # =========================
@@ -378,9 +384,13 @@ if st.session_state.json_data:
         <div class="total-box">💰 Total : {d.get("invoice_total","")}</div>
     </div>
     """, unsafe_allow_html=True)
-    if isinstance(d.get("articles"), list) and d["articles"]:
-        st.subheader("📦 Articles")
-        st.dataframe(pd.DataFrame(d["articles"]), use_container_width=True)
+    # Affichage des articles (même si la liste est vide)
+    articles = d.get("articles", [])
+    st.subheader("📦 Articles")
+    if articles and len(articles) > 0:
+        st.dataframe(pd.DataFrame(articles), use_container_width=True)
+    else:
+        st.info("Aucun article détecté dans ce document.")
 
 # =========================
 # HISTORIQUE
