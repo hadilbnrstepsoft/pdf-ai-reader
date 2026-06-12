@@ -87,7 +87,7 @@ if "chat" not in st.session_state:
     st.session_state.chat = []
 
 # =========================
-# EXTRACTION PAR REGEX (SANS API)
+# EXTRACTION TEXTE PDF
 # =========================
 def extract_text(file_bytes):
     """Extrait tout le texte d'un PDF."""
@@ -104,7 +104,7 @@ def extract_text(file_bytes):
     return "\n".join(text_parts)
 
 def extract_currencies(text):
-    """Extrait les devises (Wechselkurse) selon le pattern donné."""
+    """Extrait les devises selon le pattern fourni."""
     pattern = re.compile(r"(\d+)\s+([A-Z]{3})\s+(.+?)\s+([0-9,]+)\s+([0-9,]+)")
     currencies = []
     for line in text.splitlines():
@@ -119,27 +119,38 @@ def extract_currencies(text):
             })
     return currencies
 
-def extract_articles(text):
+# =========================
+# EXTRACTION ARTICLES AVEC REGEX PERSONNALISABLE
+# =========================
+def extract_articles_with_regex(text, regex_pattern):
     """
-    Extrait les articles d'une facture à partir du texte.
-    Pattern flexible : quantité x description prix total
-    Exemple : "2 x Clavier mécanique 45,00 EUR 90,00 EUR"
+    Extrait les articles en utilisant une regex fournie par l'utilisateur.
+    La regex doit capturer (description, quantité, prix, total) selon l'ordre.
+    Ici on suppose que la regex a 4 groupes : (quantité, description, prix, total)
     """
+    pattern = re.compile(regex_pattern, re.IGNORECASE)
     articles = []
-    # Pattern francophone/européen
-    pattern = re.compile(
-        r'(\d+(?:[\.,]\d+)?)\s*x\s+(.+?)\s+([\d\.,]+)\s*(?:EUR|€)?\s+([\d\.,]+)\s*(?:EUR|€)?',
-        re.IGNORECASE
-    )
     for line in text.splitlines():
         match = pattern.search(line)
         if match:
+            groups = match.groups()
+            # Selon le nombre de groupes, on assigne intelligemment
+            if len(groups) == 4:
+                qty, desc, price, total = groups
+            elif len(groups) == 3:
+                qty, desc, price = groups
+                total = ""
+            elif len(groups) == 2:
+                desc, qty = groups
+                price = total = ""
+            else:
+                continue
             articles.append({
                 "article_number": "",
-                "description": match.group(2).strip(),
-                "quantity": match.group(1),
-                "price": match.group(3).replace(',', '.'),
-                "total": match.group(4).replace(',', '.')
+                "description": desc.strip(),
+                "quantity": qty.strip(),
+                "price": price.strip().replace(',', '.') if price else "",
+                "total": total.strip().replace(',', '.') if total else ""
             })
     return articles
 
@@ -149,66 +160,19 @@ def extract_articles(text):
 st.set_page_config(page_title="PDF AI SaaS", layout="wide")
 st.markdown("""
 <style>
-.stApp {
-    background: linear-gradient(rgba(5,10,25,0.88), rgba(5,10,25,0.92)),
-                url("https://images.unsplash.com/photo-1516321318423-f06f85e504b3?q=80&w=2070&auto=format&fit=crop");
-    background-size: cover;
-    background-position: center;
-    background-attachment: fixed;
-    color: white;
-}
+.stApp { background: linear-gradient(rgba(5,10,25,0.88), rgba(5,10,25,0.92)), url("https://images.unsplash.com/photo-1516321318423-f06f85e504b3?q=80&w=2070&auto=format&fit=crop"); background-size: cover; background-position: center; background-attachment: fixed; color: white; }
 h1,h2,h3,h4,h5,p,label,span { color: white !important; }
 .block-container { padding-top: 2rem; }
-textarea, input {
-    background: rgba(255,255,255,0.95) !important;
-    color: black !important;
-    border-radius: 14px !important;
-}
-[data-testid="stDataFrame"] {
-    background: rgba(255,255,255,0.95);
-    border-radius: 15px;
-    overflow: hidden;
-}
+textarea, input { background: rgba(255,255,255,0.95) !important; color: black !important; border-radius: 14px !important; }
+[data-testid="stDataFrame"] { background: rgba(255,255,255,0.95); border-radius: 15px; overflow: hidden; }
 [data-testid="stDataFrame"] * { color: black !important; }
-.pdf-card {
-    background: rgba(255,255,255,0.08);
-    backdrop-filter: blur(14px);
-    border: 1px solid rgba(255,255,255,0.12);
-    border-radius: 24px;
-    padding: 28px;
-    margin-top: 20px;
-    margin-bottom: 20px;
-    box-shadow: 0 8px 32px rgba(0,0,0,0.35);
-}
-.info-row {
-    display: flex;
-    justify-content: space-between;
-    padding: 16px 0;
-    border-bottom: 1px solid rgba(255,255,255,0.08);
-}
+.pdf-card { background: rgba(255,255,255,0.08); backdrop-filter: blur(14px); border: 1px solid rgba(255,255,255,0.12); border-radius: 24px; padding: 28px; margin-top: 20px; margin-bottom: 20px; box-shadow: 0 8px 32px rgba(0,0,0,0.35); }
+.info-row { display: flex; justify-content: space-between; padding: 16px 0; border-bottom: 1px solid rgba(255,255,255,0.08); }
 .info-label { font-weight: 600; color: #94a3b8 !important; }
 .info-value { font-weight: 700; text-align: right; }
-.total-box {
-    margin-top: 20px;
-    background: linear-gradient(90deg,#2563eb,#06b6d4);
-    border-radius: 18px;
-    padding: 18px;
-    text-align: center;
-    font-size: 28px;
-    font-weight: bold;
-}
-.stButton button {
-    background: linear-gradient(90deg,#2563eb,#0ea5e9);
-    color: white;
-    border: none;
-    border-radius: 14px;
-    padding: 12px 22px;
-    font-weight: bold;
-}
-section[data-testid="stSidebar"] {
-    background: rgba(15,23,42,0.88);
-    backdrop-filter: blur(10px);
-}
+.total-box { margin-top: 20px; background: linear-gradient(90deg,#2563eb,#06b6d4); border-radius: 18px; padding: 18px; text-align: center; font-size: 28px; font-weight: bold; }
+.stButton button { background: linear-gradient(90deg,#2563eb,#0ea5e9); color: white; border: none; border-radius: 14px; padding: 12px 22px; font-weight: bold; }
+section[data-testid="stSidebar"] { background: rgba(15,23,42,0.88); backdrop-filter: blur(10px); }
 </style>
 """, unsafe_allow_html=True)
 
@@ -266,22 +230,51 @@ if file:
         st.session_state.pdf_text = text
         st.success(f"✅ Texte extrait : {len(text)} caractères")
 
+        # Affichage des lignes contenant des montants (aide au débogage)
+        st.subheader("🔍 Lignes contenant des chiffres et une devise (EUR/€/euro)")
+        lines_with_money = [l for l in text.splitlines() 
+                            if any(c.isdigit() for c in l) and ('EUR' in l or '€' in l or 'euro' in l.lower())]
+        if lines_with_money:
+            st.code("\n".join(lines_with_money[:30]))
+        else:
+            st.warning("Aucune ligne avec devise trouvée. Vérifiez que le texte est bien extrait.")
+
         # Devises
         currencies = extract_currencies(text)
         if currencies:
             st.subheader("💱 Wechselkurse (devises)")
             st.dataframe(pd.DataFrame(currencies), use_container_width=True)
 
-        # Articles (extraction automatique par regex)
-        articles = extract_articles(text)
-        if articles:
-            st.subheader("📦 Articles détectés (par regex)")
-            st.dataframe(pd.DataFrame(articles), use_container_width=True)
+        # ---------- Extraction des articles avec regex personnalisable ----------
+        st.subheader("📦 Extraction des articles")
+        
+        # Regex par défaut (essaye de capturer quantité x description prix total)
+        default_regex = r'(\d+(?:[\.,]\d+)?)\s*x\s*(.+?)\s+([\d\.,]+)\s*(?:EUR|€)?\s+([\d\.,]+)\s*(?:EUR|€)?'
+        
+        # Widget pour saisir/modifier la regex
+        custom_regex = st.text_input("Expression régulière personnalisée (si vide, utilisation de la regex par défaut)", 
+                                     value=default_regex, key="regex_input")
+        regex_to_use = custom_regex if custom_regex.strip() else default_regex
+        
+        # Bouton pour lancer l'extraction avec la regex courante
+        if st.button("🔄 Extraire les articles avec cette regex"):
+            articles = extract_articles_with_regex(text, regex_to_use)
+            if articles:
+                st.success(f"{len(articles)} article(s) trouvé(s) !")
+                st.session_state.articles_temp = articles   # stockage temporaire
+                st.dataframe(pd.DataFrame(articles), use_container_width=True)
+            else:
+                st.error("Aucun article trouvé. Ajustez votre regex en vous aidant des lignes affichées ci-dessus.")
+                st.session_state.articles_temp = []
+        
+        # Si des articles ont été extraits lors d'une tentative précédente, on les garde
+        if 'articles_temp' in st.session_state and st.session_state.articles_temp:
+            articles = st.session_state.articles_temp
         else:
-            st.info("Aucun article détecté automatiquement. Vérifiez le format du PDF.")
-
-        # Sauvegarde automatique d'un JSON minimal (sans IA)
-        if st.button("💾 Sauvegarder les données extraites"):
+            articles = []
+        
+        # Sauvegarde en base
+        if st.button("💾 Sauvegarder les données extraites (articles seulement)"):
             data = {
                 "company_name": "",
                 "document_type": "",
@@ -294,7 +287,9 @@ if file:
             save_pdf(st.session_state.user_id, file.name, data)
             st.success("✅ Données sauvegardées en base")
 
-        st.text_area("📄 Aperçu du texte extrait", text[:2000], height=300)
+        # Aperçu du texte complet
+        with st.expander("📄 Aperçu du texte extrait (premiers 2000 caractères)"):
+            st.text_area("Texte du PDF", text[:2000], height=300)
 
     except Exception as e:
         st.error(f"❌ Erreur : {type(e).__name__} – {e}")
@@ -325,14 +320,13 @@ for doc_id, filename, data in history:
         st.json(data)
 
 # =========================
-# CHAT ASSISTANT (simple)
+# CHAT ASSISTANT (recherche textuelle simple)
 # =========================
 st.divider()
 st.subheader("💬 Assistant PDF (recherche textuelle)")
 q = st.chat_input("Posez une question sur le document actuel")
 if q:
     if st.session_state.pdf_text:
-        # Recherche simple de mots-clés dans le texte
         if q.lower() in st.session_state.pdf_text.lower():
             st.chat_message("assistant").write("Oui, cette information apparaît dans le document.")
         else:
