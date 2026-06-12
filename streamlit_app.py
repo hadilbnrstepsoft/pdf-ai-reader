@@ -4,7 +4,6 @@ import pandas as pd
 import json
 import re
 import sqlite3
-from huggingface_hub import InferenceClient
 
 # =========================
 # DATABASE SETUP (tout dans le fichier)
@@ -99,30 +98,46 @@ def get_hf_client():
 
 client = get_hf_client()
 
-def ask_huggingface(prompt, model="meta-llama/Llama-3.2-3B-Instruct"):
-    if client is None:
-        return '''
-        {
-          "company_name": "Test Company",
-          "document_type": "Invoice",
-          "date": "2025-01-01",
-          "summary": "Mock data (no HF token)",
-          "invoice_total": "1000 EUR",
-          "articles": []
+import requests
+
+def ask_huggingface(prompt, model="mistralai/Mistral-7B-Instruct-v0.3"):
+    """
+    Appelle l'API Hugging Face via requests (méthode fiable).
+    """
+    token = st.secrets.get("HF_TOKEN")
+    if not token:
+        st.error("❌ HF_TOKEN manquant dans les secrets.")
+        return "{}"
+    
+    API_URL = f"https://api-inference.huggingface.co/models/{model}"
+    headers = {"Authorization": f"Bearer {token}"}
+    payload = {
+        "inputs": prompt,
+        "parameters": {
+            "max_new_tokens": 512,
+            "temperature": 0.2,
+            "return_full_text": False
         }
-        '''
+    }
+    
     try:
-        # Utilisation de la nouvelle méthode chat_completion
-        response = client.chat_completion(
-            model=model,
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=512,
-            temperature=0.2,
-            stream=False
-        )
-        return response.choices[0].message.content
+        response = requests.post(API_URL, headers=headers, json=payload, timeout=30)
+        response.raise_for_status()
+        result = response.json()
+        
+        # Le résultat peut être une liste ou un dict selon le modèle
+        if isinstance(result, list) and len(result) > 0:
+            return result[0].get("generated_text", "{}")
+        elif isinstance(result, dict):
+            return result.get("generated_text", "{}")
+        else:
+            st.error(f"Réponse inattendue : {result}")
+            return "{}"
+    except requests.exceptions.RequestException as e:
+        st.error(f"Erreur réseau : {e}")
+        return "{}"
     except Exception as e:
-        st.error(f"HF API error: {e}")
+        st.error(f"Erreur lors du traitement : {e}")
         return "{}"
 # =========================
 # PDF EXTRACTION
@@ -180,13 +195,7 @@ Question : {question}
 
 Réponds de manière claire et précise.
 """
-    if client:
-        try:
-            return client.text_generation(prompt, model="meta-llama/Llama-3.2-3B-Instruct", max_new_tokens=300)
-        except:
-            return "Erreur lors de la génération de réponse."
-    else:
-        return "Assistant non disponible (token HF manquant)."
+    return ask_huggingface(prompt, model="mistralai/Mistral-7B-Instruct-v0.3")
 
 # =========================
 # UI STYLING
@@ -331,27 +340,33 @@ if file:
             if st.button("🧠 Extraire en JSON (via IA)"):
                 with st.spinner("Appel à l'IA..."):
                     extraction_prompt = f"""
-Tu es un expert en extraction de factures.
-Réponds UNIQUEMENT avec un JSON valide, sans texte additionnel.
-Schéma :
+Analyse le document suivant et extrait les informations demandées.
+
+Règles :
+- Réponds UNIQUEMENT avec un JSON valide (aucun texte avant ou après).
+- Si une information n'est pas trouvée, mets une chaîne vide "".
+- Pour les articles, cherche des lignes qui contiennent typiquement : un nom de produit, une quantité, un prix unitaire, un total.
+- La structure JSON doit être exactement celle-ci :
+
 {{
-  "company_name": "",
-  "document_type": "",
-  "date": "",
-  "summary": "",
-  "invoice_total": "",
+  "company_name": "nom de l'entreprise émettrice",
+  "document_type": "type de document (facture, devis, etc.)",
+  "date": "date au format YYYY-MM-DD",
+  "summary": "résumé court du document",
+  "invoice_total": "montant total TTC",
   "articles": [
     {{
-      "article_number": "",
-      "description": "",
-      "quantity": "",
-      "price": "",
-      "total": ""
+      "article_number": "référence article si présente",
+      "description": "description du produit/service",
+      "quantity": "quantité (nombre)",
+      "price": "prix unitaire",
+      "total": "montant total pour cette ligne"
     }}
   ]
 }}
+
 Document :
-{text[:3500]}
+{text[:4000]}
 """
                     raw_json = ask_huggingface(extraction_prompt)
                     st.subheader("Réponse brute de l'IA")
