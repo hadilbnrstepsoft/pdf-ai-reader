@@ -6,7 +6,7 @@ import re
 import sqlite3
 
 # =========================
-# DATABASE SETUP (tout dans le fichier)
+# DATABASE SETUP
 # =========================
 DB_PATH = "saas.db"
 
@@ -68,14 +68,14 @@ def save_pdf(user_id, filename, data):
     conn = get_connection()
     c = conn.cursor()
     c.execute("INSERT INTO pdf_history (user_id, filename, json_data) VALUES (?, ?, ?)",
-              (user_id, filename, json.dumps(data)))
+              (user_id, filename, json.dumps(data, ensure_ascii=False)))
     conn.commit()
     conn.close()
 
 init_db()
 
 # =========================
-# SESSION STATE INIT
+# SESSION STATE
 # =========================
 if "user_id" not in st.session_state:
     st.session_state.user_id = None
@@ -87,62 +87,10 @@ if "chat" not in st.session_state:
     st.session_state.chat = []
 
 # =========================
-# HF INFERENCE CLIENT
-# =========================
-@st.cache_resource
-def get_hf_client():
-    token = st.secrets.get("HF_TOKEN", "")
-    if not token:
-        st.warning("⚠️ HF_TOKEN not set. JSON extraction will use mock data.")
-        return InferenceClient(token=token, provider="nebius") if token else None
-
-client = get_hf_client()
-
-import requests
-
-def ask_huggingface(prompt, model="mistralai/Mistral-7B-Instruct-v0.3"):
-    """
-    Appelle l'API Hugging Face via requests (méthode fiable).
-    """
-    token = st.secrets.get("HF_TOKEN")
-    if not token:
-        st.error("❌ HF_TOKEN manquant dans les secrets.")
-        return "{}"
-    
-    API_URL = f"https://api-inference.huggingface.co/models/{model}"
-    headers = {"Authorization": f"Bearer {token}"}
-    payload = {
-        "inputs": prompt,
-        "parameters": {
-            "max_new_tokens": 512,
-            "temperature": 0.2,
-            "return_full_text": False
-        }
-    }
-    
-    try:
-        response = requests.post(API_URL, headers=headers, json=payload, timeout=30)
-        response.raise_for_status()
-        result = response.json()
-        
-        # Le résultat peut être une liste ou un dict selon le modèle
-        if isinstance(result, list) and len(result) > 0:
-            return result[0].get("generated_text", "{}")
-        elif isinstance(result, dict):
-            return result.get("generated_text", "{}")
-        else:
-            st.error(f"Réponse inattendue : {result}")
-            return "{}"
-    except requests.exceptions.RequestException as e:
-        st.error(f"Erreur réseau : {e}")
-        return "{}"
-    except Exception as e:
-        st.error(f"Erreur lors du traitement : {e}")
-        return "{}"
-# =========================
-# PDF EXTRACTION
+# EXTRACTION PAR REGEX (SANS API)
 # =========================
 def extract_text(file_bytes):
+    """Extrait tout le texte d'un PDF."""
     if not file_bytes:
         raise ValueError("Fichier vide")
     doc = fitz.open(stream=file_bytes, filetype="pdf")
@@ -156,6 +104,7 @@ def extract_text(file_bytes):
     return "\n".join(text_parts)
 
 def extract_currencies(text):
+    """Extrait les devises (Wechselkurse) selon le pattern donné."""
     pattern = re.compile(r"(\d+)\s+([A-Z]{3})\s+(.+?)\s+([0-9,]+)\s+([0-9,]+)")
     currencies = []
     for line in text.splitlines():
@@ -170,35 +119,32 @@ def extract_currencies(text):
             })
     return currencies
 
-def parse_json(raw):
-    try:
-        return json.loads(raw)
-    except:
-        match = re.search(r"\{[\s\S]*\}", raw)
+def extract_articles(text):
+    """
+    Extrait les articles d'une facture à partir du texte.
+    Pattern flexible : quantité x description prix total
+    Exemple : "2 x Clavier mécanique 45,00 EUR 90,00 EUR"
+    """
+    articles = []
+    # Pattern francophone/européen
+    pattern = re.compile(
+        r'(\d+(?:[\.,]\d+)?)\s*x\s+(.+?)\s+([\d\.,]+)\s*(?:EUR|€)?\s+([\d\.,]+)\s*(?:EUR|€)?',
+        re.IGNORECASE
+    )
+    for line in text.splitlines():
+        match = pattern.search(line)
         if match:
-            try:
-                return json.loads(match.group())
-            except:
-                pass
-    return {"company_name": "", "document_type": "", "date": "", "summary": "", "invoice_total": "", "articles": []}
-
-def chat_with_pdf(question, pdf_text, json_data):
-    prompt = f"""
-Tu es un assistant expert en analyse de documents PDF.
-Voici le texte extrait du PDF :
-{pdf_text[:3000]}
-
-Voici les données structurées :
-{json_data}
-
-Question : {question}
-
-Réponds de manière claire et précise.
-"""
-    return ask_huggingface(prompt, model="mistralai/Mistral-7B-Instruct-v0.3")
+            articles.append({
+                "article_number": "",
+                "description": match.group(2).strip(),
+                "quantity": match.group(1),
+                "price": match.group(3).replace(',', '.'),
+                "total": match.group(4).replace(',', '.')
+            })
+    return articles
 
 # =========================
-# UI STYLING
+# UI
 # =========================
 st.set_page_config(page_title="PDF AI SaaS", layout="wide")
 st.markdown("""
@@ -233,22 +179,15 @@ textarea, input {
     margin-top: 20px;
     margin-bottom: 20px;
     box-shadow: 0 8px 32px rgba(0,0,0,0.35);
-    transition: 0.3s;
 }
-.pdf-card:hover { transform: translateY(-4px); }
 .info-row {
     display: flex;
     justify-content: space-between;
-    align-items: center;
     padding: 16px 0;
     border-bottom: 1px solid rgba(255,255,255,0.08);
 }
-.info-label {
-    font-size: 16px;
-    font-weight: 600;
-    color: #94a3b8 !important;
-}
-.info-value { font-size: 18px; font-weight: 700; text-align: right; }
+.info-label { font-weight: 600; color: #94a3b8 !important; }
+.info-value { font-weight: 700; text-align: right; }
 .total-box {
     margin-top: 20px;
     background: linear-gradient(90deg,#2563eb,#06b6d4);
@@ -257,7 +196,6 @@ textarea, input {
     text-align: center;
     font-size: 28px;
     font-weight: bold;
-    box-shadow: 0 6px 20px rgba(37,99,235,0.4);
 }
 .stButton button {
     background: linear-gradient(90deg,#2563eb,#0ea5e9);
@@ -266,9 +204,7 @@ textarea, input {
     border-radius: 14px;
     padding: 12px 22px;
     font-weight: bold;
-    transition: 0.3s;
 }
-.stButton button:hover { transform: scale(1.03); }
 section[data-testid="stSidebar"] {
     background: rgba(15,23,42,0.88);
     backdrop-filter: blur(10px);
@@ -279,7 +215,7 @@ section[data-testid="stSidebar"] {
 st.title("📄 PDF AI SaaS - Test Client")
 
 # =========================
-# AUTHENTIFICATION
+# AUTH
 # =========================
 if st.session_state.user_id is None:
     st.subheader("🔐 Connexion / Inscription")
@@ -314,7 +250,7 @@ if st.sidebar.button("Déconnexion"):
     st.rerun()
 
 # =========================
-# UPLOAD PDF AVEC GESTION D'ERREUR
+# UPLOAD PDF
 # =========================
 file = st.file_uploader("📤 Télécharger un PDF", type=["pdf"])
 
@@ -330,82 +266,53 @@ if file:
         st.session_state.pdf_text = text
         st.success(f"✅ Texte extrait : {len(text)} caractères")
 
+        # Devises
         currencies = extract_currencies(text)
         if currencies:
             st.subheader("💱 Wechselkurse (devises)")
             st.dataframe(pd.DataFrame(currencies), use_container_width=True)
 
-        col1, col2 = st.columns(2)
-        with col1:
-            if st.button("🧠 Extraire en JSON (via IA)"):
-                with st.spinner("Appel à l'IA..."):
-                    extraction_prompt = f"""
-Analyse le document suivant et extrait les informations demandées.
+        # Articles (extraction automatique par regex)
+        articles = extract_articles(text)
+        if articles:
+            st.subheader("📦 Articles détectés (par regex)")
+            st.dataframe(pd.DataFrame(articles), use_container_width=True)
+        else:
+            st.info("Aucun article détecté automatiquement. Vérifiez le format du PDF.")
 
-Règles :
-- Réponds UNIQUEMENT avec un JSON valide (aucun texte avant ou après).
-- Si une information n'est pas trouvée, mets une chaîne vide "".
-- Pour les articles, cherche des lignes qui contiennent typiquement : un nom de produit, une quantité, un prix unitaire, un total.
-- La structure JSON doit être exactement celle-ci :
+        # Sauvegarde automatique d'un JSON minimal (sans IA)
+        if st.button("💾 Sauvegarder les données extraites"):
+            data = {
+                "company_name": "",
+                "document_type": "",
+                "date": "",
+                "summary": "",
+                "invoice_total": "",
+                "articles": articles
+            }
+            st.session_state.json_data = data
+            save_pdf(st.session_state.user_id, file.name, data)
+            st.success("✅ Données sauvegardées en base")
 
-{{
-  "company_name": "nom de l'entreprise émettrice",
-  "document_type": "type de document (facture, devis, etc.)",
-  "date": "date au format YYYY-MM-DD",
-  "summary": "résumé court du document",
-  "invoice_total": "montant total TTC",
-  "articles": [
-    {{
-      "article_number": "référence article si présente",
-      "description": "description du produit/service",
-      "quantity": "quantité (nombre)",
-      "price": "prix unitaire",
-      "total": "montant total pour cette ligne"
-    }}
-  ]
-}}
-
-Document :
-{text[:4000]}
-"""
-                    raw_json = ask_huggingface(extraction_prompt)
-                    st.subheader("Réponse brute de l'IA")
-                    st.code(raw_json)
-                    data = parse_json(raw_json)
-                    st.session_state.json_data = data
-                    save_pdf(st.session_state.user_id, file.name, data)
-                    st.success("✅ Données sauvegardées en base")
-        with col2:
-            st.text_area("📄 Aperçu du texte extrait", text[:2000], height=300)
+        st.text_area("📄 Aperçu du texte extrait", text[:2000], height=300)
 
     except Exception as e:
-        st.error(f"❌ Erreur : {type(e).__name__}")
-        st.error(str(e))
+        st.error(f"❌ Erreur : {type(e).__name__} – {e}")
         st.exception(e)
-        st.stop()
 
 # =========================
-# AFFICHAGE DES DONNÉES EXTRAITES
+# AFFICHAGE DES DONNÉES SAUVEGARDÉES
 # =========================
 if st.session_state.json_data:
     d = st.session_state.json_data
-    st.subheader("📦 Données structurées")
+    st.subheader("📦 Données sauvegardées")
     st.markdown(f"""
     <div class="pdf-card">
-        <div class="info-row"><div class="info-label">🏢 Entreprise</div><div class="info-value">{d.get("company_name","")}</div></div>
-        <div class="info-row"><div class="info-label">📝 Résumé</div><div class="info-value">{d.get("summary","")}</div></div>
-        <div class="info-row"><div class="info-label">📄 Type</div><div class="info-value">{d.get("document_type","")}</div></div>
-        <div class="info-row"><div class="info-label">📅 Date</div><div class="info-value">{d.get("date","")}</div></div>
-        <div class="total-box">💰 Total : {d.get("invoice_total","")}</div>
+        <div class="info-row"><div class="info-label">📦 Articles</div><div class="info-value">{len(d.get("articles", []))} article(s)</div></div>
     </div>
     """, unsafe_allow_html=True)
-    # Affichage des articles (même si la liste est vide)
-    articles = d.get("articles", [])
-    st.subheader("📦 Articles")
-    if articles and len(articles) > 0:
-        st.dataframe(pd.DataFrame(articles), use_container_width=True)
-    else:
-        st.info("Aucun article détecté dans ce document.")
+    if d.get("articles"):
+        st.dataframe(pd.DataFrame(d["articles"]), use_container_width=True)
 
 # =========================
 # HISTORIQUE
@@ -418,25 +325,17 @@ for doc_id, filename, data in history:
         st.json(data)
 
 # =========================
-# CHAT ASSISTANT
+# CHAT ASSISTANT (simple)
 # =========================
 st.divider()
-st.subheader("💬 Assistant PDF")
-for msg in st.session_state.chat:
-    with st.chat_message(msg["role"]):
-        st.write(msg["content"])
-
-if q := st.chat_input("Posez une question sur le document actuel"):
-    st.session_state.chat.append({"role": "user", "content": q})
-    with st.chat_message("user"):
-        st.write(q)
-    with st.chat_message("assistant"):
-        with st.spinner("Réflexion..."):
-            answer = chat_with_pdf(
-                q,
-                st.session_state.pdf_text,
-                json.dumps(st.session_state.json_data) if st.session_state.json_data else "{}"
-            )
-            st.write(answer)
-    st.session_state.chat.append({"role": "assistant", "content": answer})
-    st.rerun()
+st.subheader("💬 Assistant PDF (recherche textuelle)")
+q = st.chat_input("Posez une question sur le document actuel")
+if q:
+    if st.session_state.pdf_text:
+        # Recherche simple de mots-clés dans le texte
+        if q.lower() in st.session_state.pdf_text.lower():
+            st.chat_message("assistant").write("Oui, cette information apparaît dans le document.")
+        else:
+            st.chat_message("assistant").write("Je n'ai pas trouvé cette information dans le PDF.")
+    else:
+        st.chat_message("assistant").write("Aucun PDF chargé. Téléchargez d'abord un document.")
