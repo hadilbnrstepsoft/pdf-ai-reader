@@ -13,23 +13,8 @@ DB_PATH = "saas.db"
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            username TEXT UNIQUE,
-            password TEXT
-        )
-    ''')
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS pdf_history (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            filename TEXT,
-            json_data TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY(user_id) REFERENCES users(id)
-        )
-    ''')
+    c.execute('''CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT UNIQUE, password TEXT)''')
+    c.execute('''CREATE TABLE IF NOT EXISTS pdf_history (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, filename TEXT, json_data TEXT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, FOREIGN KEY(user_id) REFERENCES users(id))''')
     conn.commit()
     conn.close()
 
@@ -87,60 +72,85 @@ if "chat" not in st.session_state:
     st.session_state.chat = []
 
 # =========================
-# EXTRACTION PAR REGEX (SANS API)
+# EXTRACTION TEXTE PDF
 # =========================
 def extract_text(file_bytes):
-    """Extrait tout le texte d'un PDF."""
     if not file_bytes:
         raise ValueError("Fichier vide")
     doc = fitz.open(stream=file_bytes, filetype="pdf")
-    text_parts = []
+    full_text = ""
     for page in doc:
-        blocks = page.get_text("blocks")
-        for b in blocks:
-            txt = b[4].strip()
-            if txt:
-                text_parts.append(txt)
-    return "\n".join(text_parts)
+        full_text += page.get_text()
+    return full_text
 
-def extract_currencies(text):
-    """Extrait les devises (Wechselkurse) selon le pattern donné."""
-    pattern = re.compile(r"(\d+)\s+([A-Z]{3})\s+(.+?)\s+([0-9,]+)\s+([0-9,]+)")
-    currencies = []
-    for line in text.splitlines():
-        m = pattern.search(line)
-        if m:
-            currencies.append({
-                "WNR": m.group(1),
-                "ISO": m.group(2),
-                "Waehrung": m.group(3).strip(),
-                "Ankauf": m.group(4),
-                "Verkauf": m.group(5)
-            })
-    return currencies
-
-def extract_articles(text):
+# =========================
+# EXTRACTION DES ARTICLES (format tableau)
+# =========================
+def extract_articles_from_text(text):
     """
-    Extrait les articles d'une facture à partir du texte.
-    Pattern flexible : quantité x description prix total
-    Exemple : "2 x Clavier mécanique 45,00 EUR 90,00 EUR"
+    Extrait les articles d'une facture ou bon de commande.
+    Cherche les lignes contenant 'Pos.' puis extrait les données structurées.
+    Exemple de ligne : "1  MA0R00004  10.000,0 kg  1,29  12.900,00  LDPE 150 E natur"
     """
+    lines = text.splitlines()
     articles = []
-    # Pattern francophone/européen
-    pattern = re.compile(
-        r'(\d+(?:[\.,]\d+)?)\s*x\s+(.+?)\s+([\d\.,]+)\s*(?:EUR|€)?\s+([\d\.,]+)\s*(?:EUR|€)?',
-        re.IGNORECASE
-    )
-    for line in text.splitlines():
-        match = pattern.search(line)
-        if match:
+    # On cherche la ligne contenant les en-têtes (Pos., Artikelnummer, Menge, etc.)
+    header_index = -1
+    for i, line in enumerate(lines):
+        if "Pos." in line and "Artikelnummer" in line and "Menge" in line:
+            header_index = i
+            break
+    
+    if header_index == -1:
+        # Fallback : chercher des motifs numériques sur les lignes suivantes
+        # On va juste chercher des lignes qui commencent par un nombre et contiennent 'kg' ou 'EUR'
+        pattern = re.compile(r'^(\d+)\s+(\S+)\s+([\d\.,]+\s*kg)\s+([\d\.,]+)\s+([\d\.,]+)\s+(.+)', re.IGNORECASE)
+        for line in lines:
+            match = pattern.match(line)
+            if match:
+                articles.append({
+                    "article_number": match.group(2),
+                    "description": match.group(6).strip(),
+                    "quantity": match.group(3).replace('kg', '').strip(),
+                    "price": match.group(4).replace(',', '.'),
+                    "total": match.group(5).replace(',', '.')
+                })
+        return articles
+
+    # On a trouvé l'en-tête, on parcourt les lignes suivantes
+    for i in range(header_index+1, len(lines)):
+        line = lines[i].strip()
+        if not line:
+            continue
+        # On essaie de splitter sur plusieurs espaces
+        parts = re.split(r'\s{2,}', line)
+        if len(parts) >= 6:
+            # Format: Pos. Artikelnummer Menge Preis Gesamtpreis Bezeichnung
+            # parts[0] = Pos (on ignore)
+            artikel_nummer = parts[1]
+            menge = parts[2].replace('kg', '').strip()
+            preis = parts[3].replace(',', '.')
+            gesamt = parts[4].replace(',', '.')
+            bezeichnung = parts[5]
             articles.append({
-                "article_number": "",
-                "description": match.group(2).strip(),
-                "quantity": match.group(1),
-                "price": match.group(3).replace(',', '.'),
-                "total": match.group(4).replace(',', '.')
+                "article_number": artikel_nummer,
+                "description": bezeichnung,
+                "quantity": menge,
+                "price": preis,
+                "total": gesamt
             })
+        else:
+            # Essayer un autre pattern (ligne sans séparateurs multiples)
+            pattern = re.compile(r'^\d+\s+(\S+)\s+([\d\.,]+\s*kg)\s+([\d\.,]+)\s+([\d\.,]+)\s+(.+)')
+            match = pattern.match(line)
+            if match:
+                articles.append({
+                    "article_number": match.group(1),
+                    "description": match.group(5).strip(),
+                    "quantity": match.group(2).replace('kg', '').strip(),
+                    "price": match.group(3).replace(',', '.'),
+                    "total": match.group(4).replace(',', '.')
+                })
     return articles
 
 # =========================
@@ -149,73 +159,26 @@ def extract_articles(text):
 st.set_page_config(page_title="PDF AI SaaS", layout="wide")
 st.markdown("""
 <style>
-.stApp {
-    background: linear-gradient(rgba(5,10,25,0.88), rgba(5,10,25,0.92)),
-                url("https://images.unsplash.com/photo-1516321318423-f06f85e504b3?q=80&w=2070&auto=format&fit=crop");
-    background-size: cover;
-    background-position: center;
-    background-attachment: fixed;
-    color: white;
-}
+.stApp { background: linear-gradient(rgba(5,10,25,0.88), rgba(5,10,25,0.92)), url("https://images.unsplash.com/photo-1516321318423-f06f85e504b3?q=80&w=2070&auto=format&fit=crop"); background-size: cover; background-position: center; background-attachment: fixed; color: white; }
 h1,h2,h3,h4,h5,p,label,span { color: white !important; }
 .block-container { padding-top: 2rem; }
-textarea, input {
-    background: rgba(255,255,255,0.95) !important;
-    color: black !important;
-    border-radius: 14px !important;
-}
-[data-testid="stDataFrame"] {
-    background: rgba(255,255,255,0.95);
-    border-radius: 15px;
-    overflow: hidden;
-}
+textarea, input { background: rgba(255,255,255,0.95) !important; color: black !important; border-radius: 14px !important; }
+[data-testid="stDataFrame"] { background: rgba(255,255,255,0.95); border-radius: 15px; overflow: hidden; }
 [data-testid="stDataFrame"] * { color: black !important; }
-.pdf-card {
-    background: rgba(255,255,255,0.08);
-    backdrop-filter: blur(14px);
-    border: 1px solid rgba(255,255,255,0.12);
-    border-radius: 24px;
-    padding: 28px;
-    margin-top: 20px;
-    margin-bottom: 20px;
-    box-shadow: 0 8px 32px rgba(0,0,0,0.35);
-}
-.info-row {
-    display: flex;
-    justify-content: space-between;
-    padding: 16px 0;
-    border-bottom: 1px solid rgba(255,255,255,0.08);
-}
+.pdf-card { background: rgba(255,255,255,0.08); backdrop-filter: blur(14px); border: 1px solid rgba(255,255,255,0.12); border-radius: 24px; padding: 28px; margin-top: 20px; margin-bottom: 20px; box-shadow: 0 8px 32px rgba(0,0,0,0.35); }
+.info-row { display: flex; justify-content: space-between; padding: 16px 0; border-bottom: 1px solid rgba(255,255,255,0.08); }
 .info-label { font-weight: 600; color: #94a3b8 !important; }
 .info-value { font-weight: 700; text-align: right; }
-.total-box {
-    margin-top: 20px;
-    background: linear-gradient(90deg,#2563eb,#06b6d4);
-    border-radius: 18px;
-    padding: 18px;
-    text-align: center;
-    font-size: 28px;
-    font-weight: bold;
-}
-.stButton button {
-    background: linear-gradient(90deg,#2563eb,#0ea5e9);
-    color: white;
-    border: none;
-    border-radius: 14px;
-    padding: 12px 22px;
-    font-weight: bold;
-}
-section[data-testid="stSidebar"] {
-    background: rgba(15,23,42,0.88);
-    backdrop-filter: blur(10px);
-}
+.total-box { margin-top: 20px; background: linear-gradient(90deg,#2563eb,#06b6d4); border-radius: 18px; padding: 18px; text-align: center; font-size: 28px; font-weight: bold; }
+.stButton button { background: linear-gradient(90deg,#2563eb,#0ea5e9); color: white; border: none; border-radius: 14px; padding: 12px 22px; font-weight: bold; }
+section[data-testid="stSidebar"] { background: rgba(15,23,42,0.88); backdrop-filter: blur(10px); }
 </style>
 """, unsafe_allow_html=True)
 
 st.title("📄 PDF AI SaaS - Test Client")
 
 # =========================
-# AUTH
+# AUTHENTIFICATION
 # =========================
 if st.session_state.user_id is None:
     st.subheader("🔐 Connexion / Inscription")
@@ -265,44 +228,31 @@ if file:
             text = extract_text(file_bytes)
         st.session_state.pdf_text = text
         st.success(f"✅ Texte extrait : {len(text)} caractères")
-        st.subheader("🔍 Lignes contenant des chiffres et une devise (EUR ou €)")
-        lines_with_money = [l for l in text.splitlines() 
-                            if any(c.isdigit() for c in l) and ('EUR' in l or '€' in l or 'euro' in l.lower())]
-        if lines_with_money:
-                st.code("\n".join(lines_with_money[:30]))
-        else:
-            st.warning("Aucune ligne avec devise trouvée. Vérifiez que le texte est bien extrait.")
 
+        # Aperçu du texte pour débogage (optionnel)
+        with st.expander("🔍 Aperçu du texte brut (premières lignes)"):
+            st.code("\n".join(text.splitlines()[:40]))
 
-        # Devises
-        currencies = extract_currencies(text)
-        if currencies:
-            st.subheader("💱 Wechselkurse (devises)")
-            st.dataframe(pd.DataFrame(currencies), use_container_width=True)
-
-        # Articles (extraction automatique par regex)
-        articles = extract_articles(text)
+        # Extraction des articles
+        articles = extract_articles_from_text(text)
         if articles:
-            st.subheader("📦 Articles détectés (par regex)")
-            st.dataframe(pd.DataFrame(articles), use_container_width=True)
+            st.subheader("📦 Articles extraits")
+            df_articles = pd.DataFrame(articles)
+            st.dataframe(df_articles, use_container_width=True)
         else:
-            st.info("Aucun article détecté automatiquement. Vérifiez le format du PDF.")
+            st.info("Aucun article trouvé. Vérifiez le format du PDF (doit contenir des lignes avec 'Pos.' et des valeurs).")
 
-        # Sauvegarde automatique d'un JSON minimal (sans IA)
-        if st.button("💾 Sauvegarder les données extraites"):
-            data = {
-                "company_name": "",
-                "document_type": "",
-                "date": "",
-                "summary": "",
-                "invoice_total": "",
-                "articles": articles
-            }
+        # Sauvegarde en base
+        if st.button("💾 Sauvegarder les articles en base"):
+            data = {"articles": articles}
             st.session_state.json_data = data
             save_pdf(st.session_state.user_id, file.name, data)
-            st.success("✅ Données sauvegardées en base")
+            st.success("✅ Données sauvegardées")
 
-        st.text_area("📄 Aperçu du texte extrait", text[:2000], height=300)
+        # Afficher le JSON extrait (pour info)
+        if articles:
+            st.subheader("📄 Données JSON extraites")
+            st.json({"articles": articles})
 
     except Exception as e:
         st.error(f"❌ Erreur : {type(e).__name__} – {e}")
@@ -312,15 +262,8 @@ if file:
 # AFFICHAGE DES DONNÉES SAUVEGARDÉES
 # =========================
 if st.session_state.json_data:
-    d = st.session_state.json_data
-    st.subheader("📦 Données sauvegardées")
-    st.markdown(f"""
-    <div class="pdf-card">
-        <div class="info-row"><div class="info-label">📦 Articles</div><div class="info-value">{len(d.get("articles", []))} article(s)</div></div>
-    </div>
-    """, unsafe_allow_html=True)
-    if d.get("articles"):
-        st.dataframe(pd.DataFrame(d["articles"]), use_container_width=True)
+    st.subheader("📦 Données sauvegardées (dernier PDF)")
+    st.json(st.session_state.json_data)
 
 # =========================
 # HISTORIQUE
@@ -333,17 +276,34 @@ for doc_id, filename, data in history:
         st.json(data)
 
 # =========================
-# CHAT ASSISTANT (simple)
+# CHAT ASSISTANT (recherche améliorée)
 # =========================
 st.divider()
-st.subheader("💬 Assistant PDF (recherche textuelle)")
-q = st.chat_input("Posez une question sur le document actuel")
-if q:
-    if st.session_state.pdf_text:
-        # Recherche simple de mots-clés dans le texte
-        if q.lower() in st.session_state.pdf_text.lower():
-            st.chat_message("assistant").write("Oui, cette information apparaît dans le document.")
+st.subheader("💬 Assistant PDF (recherche dans le texte)")
+if st.session_state.pdf_text:
+    st.info("Vous pouvez poser des questions sur le contenu du document actuel.")
+    q = st.chat_input("Votre question")
+    if q:
+        # Recherche simple par mots-clés
+        text_lower = st.session_state.pdf_text.lower()
+        q_lower = q.lower()
+        if q_lower in text_lower:
+            # Extraire le contexte autour de la réponse
+            idx = text_lower.find(q_lower)
+            start = max(0, idx-100)
+            end = min(len(text_lower), idx+200)
+            snippet = st.session_state.pdf_text[start:end]
+            st.chat_message("assistant").write(f"Oui, j'ai trouvé :\n\n...{snippet}...")
         else:
-            st.chat_message("assistant").write("Je n'ai pas trouvé cette information dans le PDF.")
-    else:
-        st.chat_message("assistant").write("Aucun PDF chargé. Téléchargez d'abord un document.")
+            # Proposer des mots clés alternatifs
+            words = q_lower.split()
+            found = []
+            for word in words:
+                if word in text_lower and len(word) > 3:
+                    found.append(word)
+            if found:
+                st.chat_message("assistant").write(f"Je n'ai pas trouvé exactement '{q}', mais voici des mots présents : {', '.join(found)}. Essayez avec ces termes.")
+            else:
+                st.chat_message("assistant").write("Désolé, je n'ai pas trouvé cette information dans le document.")
+else:
+    st.info("Téléchargez un PDF pour pouvoir poser des questions.")
